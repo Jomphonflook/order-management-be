@@ -22,6 +22,11 @@ import { SettingsModule } from './settings/settings.module.js';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         uri: config.getOrThrow<string>('DB_URL'),
+
+        serverSelectionTimeoutMS: 10000,
+        connectTimeoutMS: 10000,
+        maxPoolSize: 5,
+        minPoolSize: 0,
       }),
     }),
     JwtModule.registerAsync({
