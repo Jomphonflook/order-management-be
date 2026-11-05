@@ -9,10 +9,10 @@ import { AppModule } from './app.module.js';
 import * as dns from 'node:dns';
 
 // กำหนด DNS ก่อนเริ่มเชื่อมต่อ MongoDB
-// dns.setServers([
-//   '8.8.8.8',
-//   '8.8.4.4'
-// ]);
+dns.setServers([
+  '8.8.8.8',
+  '8.8.4.4'
+]);
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
