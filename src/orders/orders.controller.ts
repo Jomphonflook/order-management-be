@@ -17,6 +17,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard.js';
 import type { AuthenticatedRequest } from '../auth/jwt-auth.guard.js';
+import { UserRole } from '../users/user.schema.js';
 import { DashboardQueryDto } from './dto/dashboard-query.dto.js';
 import {
   CreateOrderDto,
@@ -34,7 +35,10 @@ export class OrdersController {
 
   @Get('commission-summary')
   getCommissionSummary(@Req() request: AuthenticatedRequest) {
-    return this.ordersService.getCommissionSummary(request.user.id);
+    return this.ordersService.getCommissionSummary(
+      request.user.id,
+      request.user.role,
+    );
   }
 
   @Get('dashboard')

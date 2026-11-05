@@ -7,6 +7,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { randomUUID } from 'node:crypto';
 import { isValidObjectId, Model, Types } from 'mongoose';
 import { Product } from '../products/product.schema.js';
+import { UserRole } from '../users/user.schema.js';
 import { SafeUser } from '../users/users.service.js';
 import { DashboardQueryDto } from './dto/dashboard-query.dto.js';
 import {
@@ -154,16 +155,23 @@ export class OrdersService {
     return { items, total, page, limit, pages: Math.ceil(total / limit) };
   }
 
-  async getCommissionSummary(userId: string): Promise<{
+  async getCommissionSummary(
+    userId: string,
+    role: UserRole,
+  ): Promise<{
     totalCents: number;
     pendingCents: number;
     paidCents: number;
   }> {
+    if (role !== UserRole.ADMIN) {
+      return { totalCents: 0, pendingCents: 0, paidCents: 0 };
+    }
+
     const records = await this.orderModel
       .find({
         createdBy: new Types.ObjectId(userId),
         orderStatus: { $nin: [OrderStatus.CANCELLED, OrderStatus.RETURNED] },
-        paymentStatus: { $ne: PaymentStatus.REFUNDED },
+        paymentStatus: PaymentStatus.PAID,
       })
       .select('commissionCents commissionStatus')
       .lean()
@@ -181,7 +189,7 @@ export class OrdersService {
     );
     return {
       ...summary,
-      totalCents: summary.pendingCents + summary.paidCents,
+      totalCents: summary.paidCents,
     };
   }
 
