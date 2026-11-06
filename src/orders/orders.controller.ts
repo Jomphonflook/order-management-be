@@ -107,7 +107,8 @@ export class OrdersController {
   update(
     @Param('id') id: string,
     @Body() dto: UpdateOrderDto,
+    @Req() request: AuthenticatedRequest,
   ): Promise<OrderDocument> {
-    return this.ordersService.update(id, dto);
+    return this.ordersService.update(id, dto, request.user.role);
   }
 }

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -484,7 +485,17 @@ export class OrdersService {
     return order;
   }
 
-  async update(id: string, dto: UpdateOrderDto): Promise<OrderDocument> {
+  async update(
+    id: string,
+    dto: UpdateOrderDto,
+    role: UserRole,
+  ): Promise<OrderDocument> {
+    if (dto.commissionStatus !== undefined && role !== UserRole.OWNER) {
+      throw new ForbiddenException(
+        'Only the owner can update commission status',
+      );
+    }
+
     const order = await this.findOne(id);
     const hasFields = Object.values(dto).some((value) => value !== undefined);
     if (!hasFields)
