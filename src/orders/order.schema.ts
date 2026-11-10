@@ -1,14 +1,13 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument, Schema as MongooseSchema, Types } from 'mongoose';
+import { UserRole } from '../users/user.schema.js';
 
 export enum OrderStatus {
-  PENDING = 'pending',
-  CONFIRMED = 'confirmed',
-  PROCESSING = 'processing',
-  SHIPPED = 'shipped',
-  DELIVERED = 'delivered',
-  CANCELLED = 'cancelled',
+  AWAITING_SHIPMENT = 'awaiting_shipment',
+  IN_TRANSIT = 'in_transit',
+  COMPLETED = 'completed',
   RETURNED = 'returned',
+  EXCHANGED = 'exchanged',
 }
 
 export enum PaymentStatus {
@@ -16,14 +15,6 @@ export enum PaymentStatus {
   PENDING_VERIFICATION = 'pending_verification',
   PAID = 'paid',
   REFUNDED = 'refunded',
-}
-
-export enum ShippingStatus {
-  NOT_SHIPPED = 'not_shipped',
-  PREPARING = 'preparing',
-  SHIPPED = 'shipped',
-  DELIVERED = 'delivered',
-  RETURNED = 'returned',
 }
 
 export enum PaymentMethod {
@@ -132,8 +123,14 @@ export const PaymentSlipSchema = SchemaFactory.createForClass(PaymentSlip);
 
 @Schema({ timestamps: true, versionKey: false })
 export class Order {
+  createdAt: Date;
+  updatedAt: Date;
+
   @Prop({ required: true, unique: true })
   orderNumber: string;
+
+  @Prop({ type: Date, index: true })
+  orderDate?: Date;
 
   @Prop({ type: OrderCustomerSchema, required: true })
   customer: OrderCustomer;
@@ -192,17 +189,14 @@ export class Order {
   @Prop({ type: PaymentSlipSchema, default: null })
   paymentSlip?: PaymentSlip | null;
 
-  @Prop({ required: true, type: String, enum: Object.values(ShippingStatus) })
-  shippingStatus: ShippingStatus;
-
   @Prop({ default: '', trim: true, maxlength: 100 })
   shippingCompany: string;
 
   @Prop({ default: '', trim: true, maxlength: 100 })
   trackingNumber: string;
 
-  @Prop()
-  shippedAt?: Date;
+  @Prop({ type: String, select: false })
+  shippingStatus?: string;
 
   @Prop({
     type: MongooseSchema.Types.ObjectId,
@@ -218,6 +212,9 @@ export class Order {
   @Prop({ required: true, lowercase: true, trim: true })
   createdByEmail: string;
 
+  @Prop({ type: String, enum: Object.values(UserRole) })
+  createdByRole?: UserRole;
+
   @Prop({ required: true, type: String, enum: Object.values(CommissionStatus) })
   commissionStatus: CommissionStatus;
 
@@ -231,3 +228,14 @@ export const OrderSchema = SchemaFactory.createForClass(Order);
 OrderSchema.index({ createdAt: -1 });
 OrderSchema.index({ orderStatus: 1, createdAt: -1 });
 OrderSchema.index({ paymentStatus: 1, createdAt: -1 });
+
+@Schema({ versionKey: false })
+export class OrderCounter {
+  @Prop({ required: true, unique: true })
+  period: string;
+
+  @Prop({ required: true, min: 0, default: 0 })
+  sequence: number;
+}
+
+export const OrderCounterSchema = SchemaFactory.createForClass(OrderCounter);
