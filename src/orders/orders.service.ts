@@ -1,17 +1,19 @@
 import {
   BadRequestException,
   ForbiddenException,
+  InternalServerErrorException,
   Injectable,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { randomUUID } from 'node:crypto';
 import { isValidObjectId, Model, Types } from 'mongoose';
 import { Product } from '../products/product.schema.js';
-import { UserRole } from '../users/user.schema.js';
+import { User, UserRole } from '../users/user.schema.js';
 import { SafeUser } from '../users/users.service.js';
 import { DashboardQueryDto } from './dto/dashboard-query.dto.js';
 import {
+  BulkUpdateOrderStatusDto,
   CreateOrderDto,
   ListOrdersQueryDto,
   UpdateOrderDto,
@@ -19,13 +21,13 @@ import {
 import {
   CommissionStatus,
   Order,
+  OrderCounter,
   OrderDocument,
   OrderItem,
   OrderStatus,
   PaymentMethod,
   PaymentSlip,
   PaymentStatus,
-  ShippingStatus,
 } from './order.schema.js';
 import {
   PaymentSlipStorageService,
@@ -43,14 +45,16 @@ export interface OrderListResult {
 export interface DashboardData {
   summary: {
     totalOrders: number;
-    pendingOrders: number;
+    awaitingShipmentOrders: number;
+    inTransitOrders: number;
     unpaidOrders: number;
     completedOrders: number;
-    cancelledOrders: number;
     returnedOrders: number;
+    exchangedOrders: number;
     salesCents: number;
     receivedCents: number;
     paidCommissionCents: number;
+    commissionTotalCents: number;
     productCostCents: number;
     shippingCostCents: number;
     otherExpensesCents: number;
@@ -65,6 +69,7 @@ export interface DashboardData {
     salesCents: number;
     commissionCents: number;
     paidCommissionCents: number;
+    dueCommissionCents: number;
   }>;
   topProducts: Array<{
     productId: string;
@@ -86,39 +91,197 @@ type DashboardProductRow = DashboardData['topProducts'][number];
 type DashboardDailyRow = DashboardData['dailySales'][number];
 
 @Injectable()
-export class OrdersService {
+export class OrdersService implements OnModuleInit {
   constructor(
     @InjectModel(Order.name) private readonly orderModel: Model<Order>,
+    @InjectModel(OrderCounter.name)
+    private readonly orderCounterModel: Model<OrderCounter>,
     @InjectModel(Product.name) private readonly productModel: Model<Product>,
+    @InjectModel(User.name) private readonly userModel: Model<User>,
     private readonly paymentSlipStorage: PaymentSlipStorageService,
   ) {}
 
+  async onModuleInit(): Promise<void> {
+    await this.migrateLegacyOrders();
+  }
+
+  private async migrateLegacyOrders(): Promise<void> {
+    const currentOrderNumber = /^\d{6}-\d{4,}$/;
+    const legacyStatuses: OrderStatus[] = [
+      'pending' as OrderStatus,
+      'confirmed' as OrderStatus,
+      'processing' as OrderStatus,
+      'shipped' as OrderStatus,
+      'delivered' as OrderStatus,
+      'cancelled' as OrderStatus,
+    ];
+    const hasLegacyOrders = await this.orderModel.exists({
+      $or: [
+        { orderStatus: { $in: legacyStatuses } },
+        { orderNumber: { $not: currentOrderNumber } },
+        { shippingStatus: { $exists: true } },
+        { orderDate: { $exists: false } },
+        { createdByRole: { $exists: false } },
+      ],
+    });
+    if (!hasLegacyOrders) return;
+
+    const statusMappings: Array<[OrderStatus, OrderStatus]> = [
+      ['pending' as OrderStatus, OrderStatus.AWAITING_SHIPMENT],
+      ['confirmed' as OrderStatus, OrderStatus.AWAITING_SHIPMENT],
+      ['processing' as OrderStatus, OrderStatus.AWAITING_SHIPMENT],
+      ['shipped' as OrderStatus, OrderStatus.IN_TRANSIT],
+      ['delivered' as OrderStatus, OrderStatus.COMPLETED],
+      ['cancelled' as OrderStatus, OrderStatus.RETURNED],
+    ];
+    for (const [legacyStatus, currentStatus] of statusMappings) {
+      await this.orderModel
+        .updateMany(
+          { orderStatus: legacyStatus },
+          { $set: { orderStatus: currentStatus } },
+          { timestamps: false },
+        )
+        .exec();
+    }
+
+    await this.orderModel
+      .updateMany(
+        { shippingStatus: { $exists: true } },
+        { $unset: { shippingStatus: 1 } },
+        { timestamps: false },
+      )
+      .exec();
+
+    const ordersWithoutOrderDate = await this.orderModel
+      .find({ orderDate: { $exists: false } })
+      .select('_id createdAt')
+      .lean()
+      .exec();
+    for (const order of ordersWithoutOrderDate) {
+      await this.orderModel
+        .updateOne(
+          { _id: order._id, orderDate: { $exists: false } },
+          { $set: { orderDate: order.createdAt } },
+          { timestamps: false },
+        )
+        .exec();
+    }
+
+    const ordersToRenumber = await this.orderModel
+      .find({ orderNumber: { $not: currentOrderNumber } })
+      .select('_id orderNumber createdAt')
+      .sort({ createdAt: 1, _id: 1 })
+      .lean()
+      .exec();
+    for (const order of ordersToRenumber) {
+      const number = await this.nextOrderNumberForPeriod(
+        this.orderPeriod(order.createdAt),
+      );
+      await this.orderModel
+        .updateOne(
+          { _id: order._id, orderNumber: order.orderNumber },
+          { $set: { orderNumber: number } },
+          { timestamps: false },
+        )
+        .exec();
+    }
+
+    await this.migrateCreatorRolesAndOwnerCommissions();
+  }
+
+  private async migrateCreatorRolesAndOwnerCommissions(): Promise<void> {
+    const users = await this.userModel.find().select('_id role').lean().exec();
+    const ownerIds = users
+      .filter((user) => user.role === UserRole.OWNER)
+      .map((user) => user._id);
+    const adminIds = users
+      .filter((user) => user.role === UserRole.ADMIN)
+      .map((user) => user._id);
+
+    if (ownerIds.length > 0) {
+      await this.orderModel
+        .updateMany(
+          {
+            createdBy: { $in: ownerIds },
+            createdByRole: { $exists: false },
+          },
+          [
+            {
+              $set: {
+                createdByRole: UserRole.OWNER,
+                items: {
+                  $map: {
+                    input: '$items',
+                    as: 'item',
+                    in: {
+                      $mergeObjects: [
+                        '$$item',
+                        { commissionCents: 0 },
+                      ],
+                    },
+                  },
+                },
+                netProfitCents: {
+                  $add: ['$netProfitCents', '$commissionCents'],
+                },
+                commissionCents: 0,
+              },
+            },
+          ],
+          { timestamps: false, updatePipeline: true },
+        )
+        .exec();
+    }
+
+    if (adminIds.length > 0) {
+      await this.orderModel
+        .updateMany(
+          {
+            createdBy: { $in: adminIds },
+            createdByRole: { $exists: false },
+          },
+          { $set: { createdByRole: UserRole.ADMIN } },
+          { timestamps: false },
+        )
+        .exec();
+    }
+  }
+
   async create(dto: CreateOrderDto, user: SafeUser): Promise<OrderDocument> {
-    const items = await this.createItemSnapshots(dto.items);
+    const items = this.withCommission(
+      await this.createItemSnapshots(dto.items),
+      user.role === UserRole.ADMIN,
+    );
+    const createdAt = new Date();
     const financials = this.calculateFinancials(
       items,
       dto.discount,
-      dto.shippingCharge,
+      0,
       dto.shippingCost ?? 0,
-      dto.otherExpenses,
+      0,
+    );
+    const orderNumber = await this.nextOrderNumberForPeriod(
+      this.orderPeriod(createdAt),
     );
 
     return this.orderModel.create({
-      orderNumber: this.createOrderNumber(),
+      orderNumber,
+      orderDate: createdAt,
+      createdAt,
       customer: this.normalizeCustomer(dto.customer),
       items,
       ...financials,
-      orderStatus: OrderStatus.PENDING,
+      orderStatus: OrderStatus.AWAITING_SHIPMENT,
       paymentStatus: PaymentStatus.UNPAID,
       paymentMethod: dto.paymentMethod,
       amountPaidCents: 0,
       paymentNote: dto.paymentNote?.trim() ?? '',
-      shippingStatus: ShippingStatus.NOT_SHIPPED,
       shippingCompany: '',
       trackingNumber: '',
       createdBy: new Types.ObjectId(user.id),
       createdByName: user.name,
       createdByEmail: user.email,
+      createdByRole: user.role,
       commissionStatus: CommissionStatus.PENDING,
     });
   }
@@ -127,6 +290,26 @@ export class OrdersService {
     const filter: Record<string, unknown> = {};
     if (query.orderStatus) filter.orderStatus = query.orderStatus;
     if (query.paymentStatus) filter.paymentStatus = query.paymentStatus;
+    if (query.dateFrom || query.dateTo) {
+      const start = query.dateFrom
+        ? this.bangkokDateStart(query.dateFrom)
+        : undefined;
+      const end = query.dateTo
+        ? new Date(
+            this.bangkokDateStart(query.dateTo).getTime() +
+              24 * 60 * 60 * 1000,
+          )
+        : undefined;
+      if (query.dateFrom && query.dateTo && query.dateFrom > query.dateTo) {
+        throw new BadRequestException(
+          'The start date must be on or before the end date',
+        );
+      }
+      filter.orderDate = {
+        ...(start ? { $gte: start } : {}),
+        ...(end ? { $lt: end } : {}),
+      };
+    }
     if (query.search?.trim()) {
       const escaped = query.search
         .trim()
@@ -146,7 +329,7 @@ export class OrdersService {
     const [items, total] = await Promise.all([
       this.orderModel
         .find(filter)
-        .sort({ createdAt: -1 })
+        .sort({ orderDate: -1, createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .exec(),
@@ -154,6 +337,65 @@ export class OrdersService {
     ]);
 
     return { items, total, page, limit, pages: Math.ceil(total / limit) };
+  }
+
+  async bulkUpdateStatuses(
+    dto: BulkUpdateOrderStatusDto,
+    role: UserRole,
+  ): Promise<OrderDocument[]> {
+    const hasStatus =
+      dto.orderStatus !== undefined ||
+      dto.paymentStatus !== undefined ||
+      dto.commissionStatus !== undefined;
+    if (!hasStatus) {
+      throw new BadRequestException('Select at least one status to update');
+    }
+    if (dto.commissionStatus !== undefined && role !== UserRole.OWNER) {
+      throw new ForbiddenException(
+        'Only the owner can update commission status',
+      );
+    }
+
+    const uniqueIds = [...new Set(dto.orderIds)];
+    const orders = await this.orderModel
+      .find({ _id: { $in: uniqueIds } })
+      .exec();
+    if (orders.length !== uniqueIds.length) {
+      throw new NotFoundException('One or more selected orders were not found');
+    }
+
+    for (const order of orders) {
+      if (dto.orderStatus !== undefined) {
+        order.orderStatus = dto.orderStatus;
+      }
+      if (dto.paymentStatus !== undefined) {
+        const wasPaid = order.paymentStatus === PaymentStatus.PAID;
+        order.paymentStatus = dto.paymentStatus;
+        if (dto.paymentStatus === PaymentStatus.PAID) {
+          order.amountPaidCents = order.totalCents;
+          if (!wasPaid) order.paidAt = new Date();
+        } else if (dto.paymentStatus === PaymentStatus.UNPAID) {
+          order.amountPaidCents = 0;
+          order.paidAt = undefined;
+        } else if (dto.paymentStatus === PaymentStatus.PENDING_VERIFICATION) {
+          order.paidAt = undefined;
+        }
+      }
+      if (dto.commissionStatus !== undefined) {
+        const wasPaid = order.commissionStatus === CommissionStatus.PAID;
+        order.commissionStatus = dto.commissionStatus;
+        if (
+          dto.commissionStatus === CommissionStatus.PAID &&
+          !wasPaid
+        ) {
+          order.commissionPaidAt = new Date();
+        } else if (dto.commissionStatus === CommissionStatus.PENDING) {
+          order.commissionPaidAt = undefined;
+        }
+      }
+    }
+
+    return Promise.all(orders.map((order) => order.save()));
   }
 
   async getCommissionSummary(
@@ -171,7 +413,10 @@ export class OrdersService {
     const records = await this.orderModel
       .find({
         createdBy: new Types.ObjectId(userId),
-        orderStatus: { $nin: [OrderStatus.CANCELLED, OrderStatus.RETURNED] },
+      createdByRole: UserRole.ADMIN,
+      orderStatus: {
+        $nin: [OrderStatus.RETURNED, OrderStatus.EXCHANGED],
+      },
         paymentStatus: PaymentStatus.PAID,
       })
       .select('commissionCents commissionStatus')
@@ -198,7 +443,7 @@ export class OrdersService {
     const { filter, from, to } = this.createDashboardFilter(query);
     const page = query.page ?? 1;
     const limit = query.limit ?? 10;
-    const sortBy = query.sortBy ?? 'createdAt';
+    const sortBy = query.sortBy ?? 'orderDate';
     const sortDirection = query.sortOrder === 'asc' ? 1 : -1;
     const dateFormat =
       query.interval === 'year'
@@ -213,7 +458,7 @@ export class OrdersService {
             {
               $in: [
                 '$orderStatus',
-                [OrderStatus.CANCELLED, OrderStatus.RETURNED],
+                [OrderStatus.RETURNED, OrderStatus.EXCHANGED],
               ],
             },
           ],
@@ -237,10 +482,21 @@ export class OrdersService {
               $group: {
                 _id: null,
                 totalOrders: { $sum: 1 },
-                pendingOrders: {
+                awaitingShipmentOrders: {
                   $sum: {
                     $cond: [
-                      { $eq: ['$orderStatus', OrderStatus.PENDING] },
+                      {
+                        $eq: ['$orderStatus', OrderStatus.AWAITING_SHIPMENT],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+                inTransitOrders: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ['$orderStatus', OrderStatus.IN_TRANSIT] },
                       1,
                       0,
                     ],
@@ -266,16 +522,7 @@ export class OrdersService {
                 completedOrders: {
                   $sum: {
                     $cond: [
-                      { $eq: ['$orderStatus', OrderStatus.DELIVERED] },
-                      1,
-                      0,
-                    ],
-                  },
-                },
-                cancelledOrders: {
-                  $sum: {
-                    $cond: [
-                      { $eq: ['$orderStatus', OrderStatus.CANCELLED] },
+                      { $eq: ['$orderStatus', OrderStatus.COMPLETED] },
                       1,
                       0,
                     ],
@@ -285,6 +532,15 @@ export class OrdersService {
                   $sum: {
                     $cond: [
                       { $eq: ['$orderStatus', OrderStatus.RETURNED] },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+                exchangedOrders: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ['$orderStatus', OrderStatus.EXCHANGED] },
                       1,
                       0,
                     ],
@@ -308,7 +564,22 @@ export class OrdersService {
                       {
                         $and: [
                           eligibleSales,
+                          { $eq: ['$createdByRole', UserRole.ADMIN] },
                           { $eq: ['$commissionStatus', CommissionStatus.PAID] },
+                        ],
+                      },
+                      '$commissionCents',
+                      0,
+                    ],
+                  },
+                },
+                commissionTotalCents: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          eligibleSales,
+                          { $eq: ['$createdByRole', UserRole.ADMIN] },
                         ],
                       },
                       '$commissionCents',
@@ -345,7 +616,7 @@ export class OrdersService {
                 _id: {
                   $dateToString: {
                     format: dateFormat,
-                    date: '$createdAt',
+                    date: '$orderDate',
                     timezone: 'Asia/Bangkok',
                   },
                 },
@@ -360,6 +631,7 @@ export class OrdersService {
           .aggregate<DashboardAdminRow>([
             { $match: filter },
             eligibleStage,
+            { $match: { createdByRole: UserRole.ADMIN } },
             {
               $group: {
                 _id: '$createdBy',
@@ -376,6 +648,20 @@ export class OrdersService {
                     ],
                   },
                 },
+                dueCommissionCents: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $ne: [
+                          '$commissionStatus',
+                          CommissionStatus.PAID,
+                        ],
+                      },
+                      '$commissionCents',
+                      0,
+                    ],
+                  },
+                },
               },
             },
             {
@@ -387,6 +673,7 @@ export class OrdersService {
                 salesCents: 1,
                 commissionCents: 1,
                 paidCommissionCents: 1,
+                dueCommissionCents: 1,
               },
             },
             { $sort: { salesCents: -1 } },
@@ -500,32 +787,34 @@ export class OrdersService {
     const hasFields = Object.values(dto).some((value) => value !== undefined);
     if (!hasFields)
       throw new BadRequestException('Provide at least one order update');
+    const orderDate =
+      dto.orderDate === undefined ? undefined : new Date(dto.orderDate);
+    if (orderDate && !Number.isFinite(orderDate.getTime())) {
+      throw new BadRequestException('Order date must be valid');
+    }
 
-    const items = dto.items
-      ? await this.createItemSnapshots(dto.items, order.items)
-      : order.items;
+    const items = this.withCommission(
+      dto.items
+        ? await this.createItemSnapshots(dto.items, order.items)
+        : order.items,
+      order.createdByRole === UserRole.ADMIN,
+    );
     const discount = dto.discount ?? order.discountCents / 100;
-    const shippingCharge =
-      dto.shippingCharge ?? order.shippingChargeCents / 100;
+    const shippingCharge = order.shippingChargeCents / 100;
     const shippingCost =
       dto.shippingCost ?? (order.shippingCostCents ?? 0) / 100;
-    const otherExpenses = dto.otherExpenses ?? order.otherExpensesCents / 100;
+    const otherExpenses = order.otherExpensesCents / 100;
     if (dto.customer) order.customer = this.normalizeCustomer(dto.customer);
     if (dto.items) order.items = items;
     if (dto.discount !== undefined)
       order.discountCents = this.toCents(dto.discount);
-    if (dto.shippingCharge !== undefined) {
-      order.shippingChargeCents = this.toCents(dto.shippingCharge);
-    }
     if (dto.shippingCost !== undefined) {
       order.shippingCostCents = this.toCents(dto.shippingCost);
-    }
-    if (dto.otherExpenses !== undefined) {
-      order.otherExpensesCents = this.toCents(dto.otherExpenses);
     }
     if (dto.paymentMethod !== undefined)
       order.paymentMethod = dto.paymentMethod;
     if (dto.orderStatus !== undefined) order.orderStatus = dto.orderStatus;
+    if (orderDate) order.orderDate = orderDate;
     const markingPaid =
       dto.paymentStatus === PaymentStatus.PAID &&
       order.paymentStatus !== PaymentStatus.PAID;
@@ -546,12 +835,6 @@ export class OrdersService {
     }
     if (dto.paymentNote !== undefined)
       order.paymentNote = dto.paymentNote.trim();
-    if (dto.shippingStatus !== undefined) {
-      order.shippingStatus = dto.shippingStatus;
-      if (dto.shippingStatus === ShippingStatus.SHIPPED && !order.shippedAt) {
-        order.shippedAt = new Date();
-      }
-    }
     if (dto.shippingCompany !== undefined) {
       order.shippingCompany = dto.shippingCompany.trim();
     }
@@ -661,6 +944,11 @@ export class OrdersService {
     });
   }
 
+  private withCommission(items: OrderItem[], enabled: boolean): OrderItem[] {
+    if (enabled) return items;
+    return items.map((item) => ({ ...item, commissionCents: 0 }));
+  }
+
   private resizeItemSnapshot(item: OrderItem, quantity: number): OrderItem {
     const subtotalCents = item.sellingPriceCents * quantity;
     const costTotalCents = item.costPriceCents * quantity;
@@ -704,7 +992,7 @@ export class OrdersService {
       this.bangkokDateStart(to).getTime() + 24 * 60 * 60 * 1000,
     );
     const filter: Record<string, unknown> = {
-      createdAt: { $gte: start, $lt: end },
+      orderDate: { $gte: start, $lt: end },
     };
     if (query.orderStatus) filter.orderStatus = query.orderStatus;
     if (query.paymentStatus) filter.paymentStatus = query.paymentStatus;
@@ -741,14 +1029,16 @@ export class OrdersService {
   private emptyDashboardSummary(): DashboardData['summary'] {
     return {
       totalOrders: 0,
-      pendingOrders: 0,
+      awaitingShipmentOrders: 0,
+      inTransitOrders: 0,
       unpaidOrders: 0,
       completedOrders: 0,
-      cancelledOrders: 0,
       returnedOrders: 0,
+      exchangedOrders: 0,
       salesCents: 0,
       receivedCents: 0,
       paidCommissionCents: 0,
+      commissionTotalCents: 0,
       productCostCents: 0,
       shippingCostCents: 0,
       otherExpensesCents: 0,
@@ -848,9 +1138,53 @@ export class OrdersService {
     }
   }
 
-  private createOrderNumber(): string {
-    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    return `ORD-${date}-${randomUUID().replace(/-/g, '').toUpperCase()}`;
+  private orderPeriod(date: Date): string {
+    const parts = new Intl.DateTimeFormat('en', {
+      timeZone: 'Asia/Bangkok',
+      year: 'numeric',
+      month: '2-digit',
+    }).formatToParts(date);
+    const year = parts.find((part) => part.type === 'year')?.value;
+    const month = parts.find((part) => part.type === 'month')?.value;
+    if (!year || !month) {
+      throw new InternalServerErrorException('Could not determine order month');
+    }
+    return `${year}${month}`;
+  }
+
+  private async nextOrderNumberForPeriod(period: string): Promise<string> {
+    let counter: OrderCounter | null;
+    try {
+      counter = await this.orderCounterModel
+        .findOneAndUpdate(
+          { period },
+          { $inc: { sequence: 1 } },
+          { new: true, upsert: true },
+        )
+        .exec();
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== 'object' ||
+        !('code' in error) ||
+        error.code !== 11000
+      ) {
+        throw error;
+      }
+      counter = await this.orderCounterModel
+        .findOneAndUpdate(
+          { period },
+          { $inc: { sequence: 1 } },
+          { new: true },
+        )
+        .exec();
+    }
+    if (!counter) {
+      throw new InternalServerErrorException(
+        'Could not allocate an order number',
+      );
+    }
+    return `${period}-${counter.sequence.toString().padStart(4, '0')}`;
   }
 
   private validateId(id: string): void {

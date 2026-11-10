@@ -20,6 +20,7 @@ import type { AuthenticatedRequest } from '../auth/jwt-auth.guard.js';
 import { UserRole } from '../users/user.schema.js';
 import { DashboardQueryDto } from './dto/dashboard-query.dto.js';
 import {
+  BulkUpdateOrderStatusDto,
   CreateOrderDto,
   ListOrdersQueryDto,
   UpdateOrderDto,
@@ -57,6 +58,17 @@ export class OrdersController {
   @Get()
   findAll(@Query() query: ListOrdersQueryDto): Promise<OrderListResult> {
     return this.ordersService.findAll(query);
+  }
+
+  @Patch('bulk-status')
+  bulkUpdateStatuses(
+    @Body() dto: BulkUpdateOrderStatusDto,
+    @Req() request: AuthenticatedRequest,
+  ): Promise<OrderDocument[]> {
+    return this.ordersService.bulkUpdateStatuses(
+      dto,
+      request.user.role,
+    );
   }
 
   @Post(':id/payment-slip')

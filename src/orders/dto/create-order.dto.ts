@@ -4,6 +4,7 @@ import {
   ArrayMinSize,
   IsArray,
   IsEnum,
+  IsDateString,
   IsInt,
   IsNumber,
   IsOptional,
@@ -20,7 +21,6 @@ import {
   OrderStatus,
   PaymentMethod,
   PaymentStatus,
-  ShippingStatus,
 } from '../order.schema.js';
 
 const toNumber = ({ value }: { value: unknown }) => {
@@ -110,21 +110,11 @@ export class CreateOrderDto {
   @Min(0)
   discount: number;
 
-  @Transform(toNumber)
-  @IsNumber({ maxDecimalPlaces: 2 })
-  @Min(0)
-  shippingCharge: number;
-
   @IsOptional()
   @Transform(toNumber)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
   shippingCost?: number;
-
-  @Transform(toNumber)
-  @IsNumber({ maxDecimalPlaces: 2 })
-  @Min(0)
-  otherExpenses: number;
 
   @IsEnum(PaymentMethod)
   paymentMethod: PaymentMethod;
@@ -159,19 +149,7 @@ export class UpdateOrderDto {
   @Transform(toNumber)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
-  shippingCharge?: number;
-
-  @IsOptional()
-  @Transform(toNumber)
-  @IsNumber({ maxDecimalPlaces: 2 })
-  @Min(0)
   shippingCost?: number;
-
-  @IsOptional()
-  @Transform(toNumber)
-  @IsNumber({ maxDecimalPlaces: 2 })
-  @Min(0)
-  otherExpenses?: number;
 
   @IsOptional()
   @IsEnum(PaymentMethod)
@@ -180,6 +158,10 @@ export class UpdateOrderDto {
   @IsOptional()
   @IsEnum(OrderStatus)
   orderStatus?: OrderStatus;
+
+  @IsOptional()
+  @IsDateString()
+  orderDate?: string;
 
   @IsOptional()
   @IsEnum(PaymentStatus)
@@ -197,10 +179,6 @@ export class UpdateOrderDto {
   paymentNote?: string;
 
   @IsOptional()
-  @IsEnum(ShippingStatus)
-  shippingStatus?: ShippingStatus;
-
-  @IsOptional()
   @IsString()
   @MaxLength(100)
   shippingCompany?: string;
@@ -209,6 +187,27 @@ export class UpdateOrderDto {
   @IsString()
   @MaxLength(100)
   trackingNumber?: string;
+
+  @IsOptional()
+  @IsEnum(CommissionStatus)
+  commissionStatus?: CommissionStatus;
+}
+
+export class BulkUpdateOrderStatusDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @IsString({ each: true })
+  @Matches(/^[a-f\d]{24}$/i, { each: true })
+  orderIds: string[];
+
+  @IsOptional()
+  @IsEnum(OrderStatus)
+  orderStatus?: OrderStatus;
+
+  @IsOptional()
+  @IsEnum(PaymentStatus)
+  paymentStatus?: PaymentStatus;
 
   @IsOptional()
   @IsEnum(CommissionStatus)
@@ -241,4 +240,12 @@ export class ListOrdersQueryDto {
   @IsOptional()
   @IsEnum(PaymentStatus)
   paymentStatus?: PaymentStatus;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  dateFrom?: string;
+
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  dateTo?: string;
 }

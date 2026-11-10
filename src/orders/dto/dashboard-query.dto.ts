@@ -49,9 +49,9 @@ export class DashboardQueryDto {
   limit = 10;
 
   @IsOptional()
-  @IsIn(['createdAt', 'orderNumber', 'customer.name', 'totalCents'])
-  sortBy: 'createdAt' | 'orderNumber' | 'customer.name' | 'totalCents' =
-    'createdAt';
+  @IsIn(['orderDate', 'orderNumber', 'customer.name', 'totalCents'])
+  sortBy: 'orderDate' | 'orderNumber' | 'customer.name' | 'totalCents' =
+    'orderDate';
 
   @IsOptional()
   @IsIn(['asc', 'desc'])
