@@ -451,28 +451,17 @@ export class OrdersService implements OnModuleInit {
         : query.interval === 'month'
           ? '%Y-%m'
           : '%Y-%m-%d';
-    const eligibleSales = {
-      $and: [
+    const eligibleOrder = {
+      $not: [
         {
-          $not: [
-            {
-              $in: [
-                '$orderStatus',
-                [OrderStatus.RETURNED, OrderStatus.EXCHANGED],
-              ],
-            },
-          ],
-        },
-        { $ne: ['$paymentStatus', PaymentStatus.REFUNDED] },
-        {
-          $or: [
-            { $eq: ['$paymentMethod', PaymentMethod.COD] },
-            { $eq: ['$paymentStatus', PaymentStatus.PAID] },
+          $in: [
+            '$orderStatus',
+            [OrderStatus.RETURNED, OrderStatus.EXCHANGED],
           ],
         },
       ],
     };
-    const eligibleStage = { $match: { $expr: eligibleSales } };
+    const eligibleOrderStage = { $match: { $expr: eligibleOrder } };
     const [summaryRows, dailySales, salesByAdmin, topProducts, recentOrders] =
       await Promise.all([
         this.orderModel
@@ -546,9 +535,7 @@ export class OrdersService implements OnModuleInit {
                     ],
                   },
                 },
-                salesCents: {
-                  $sum: { $cond: [eligibleSales, '$totalCents', 0] },
-                },
+                salesCents: { $sum: { $cond: [eligibleOrder, '$totalCents', 0] } },
                 receivedCents: {
                   $sum: {
                     $cond: [
@@ -563,7 +550,7 @@ export class OrdersService implements OnModuleInit {
                     $cond: [
                       {
                         $and: [
-                          eligibleSales,
+                          eligibleOrder,
                           { $eq: ['$createdByRole', UserRole.ADMIN] },
                           { $eq: ['$commissionStatus', CommissionStatus.PAID] },
                         ],
@@ -578,7 +565,7 @@ export class OrdersService implements OnModuleInit {
                     $cond: [
                       {
                         $and: [
-                          eligibleSales,
+                          eligibleOrder,
                           { $eq: ['$createdByRole', UserRole.ADMIN] },
                         ],
                       },
@@ -588,19 +575,48 @@ export class OrdersService implements OnModuleInit {
                   },
                 },
                 productCostCents: {
-                  $sum: { $cond: [eligibleSales, '$productCostCents', 0] },
+                  $sum: { $cond: [eligibleOrder, '$productCostCents', 0] },
                 },
                 shippingCostCents: {
-                  $sum: { $cond: [eligibleSales, '$shippingCostCents', 0] },
+                  $sum: { $cond: [eligibleOrder, '$shippingCostCents', 0] },
                 },
                 otherExpensesCents: {
-                  $sum: { $cond: [eligibleSales, '$otherExpensesCents', 0] },
+                  $sum: { $cond: [eligibleOrder, '$otherExpensesCents', 0] },
                 },
                 grossProfitCents: {
-                  $sum: { $cond: [eligibleSales, '$grossProfitCents', 0] },
+                  $sum: {
+                    $cond: [
+                      eligibleOrder,
+                      {
+                        $subtract: [
+                          '$totalCents',
+                          { $ifNull: ['$productCostCents', 0] },
+                        ],
+                      },
+                      0,
+                    ],
+                  },
                 },
                 netProfitCents: {
-                  $sum: { $cond: [eligibleSales, '$netProfitCents', 0] },
+                  $sum: {
+                    $cond: [
+                      eligibleOrder,
+                      {
+                        $subtract: [
+                          '$totalCents',
+                          {
+                            $add: [
+                              { $ifNull: ['$productCostCents', 0] },
+                              { $ifNull: ['$commissionCents', 0] },
+                              { $ifNull: ['$shippingCostCents', 0] },
+                              { $ifNull: ['$otherExpensesCents', 0] },
+                            ],
+                          },
+                        ],
+                      },
+                      0,
+                    ],
+                  },
                 },
               },
             },
@@ -610,7 +626,7 @@ export class OrdersService implements OnModuleInit {
         this.orderModel
           .aggregate<DashboardDailyRow>([
             { $match: filter },
-            eligibleStage,
+            eligibleOrderStage,
             {
               $group: {
                 _id: {
@@ -630,7 +646,7 @@ export class OrdersService implements OnModuleInit {
         this.orderModel
           .aggregate<DashboardAdminRow>([
             { $match: filter },
-            eligibleStage,
+            eligibleOrderStage,
             { $match: { createdByRole: UserRole.ADMIN } },
             {
               $group: {
@@ -682,7 +698,7 @@ export class OrdersService implements OnModuleInit {
         this.orderModel
           .aggregate<DashboardProductRow>([
             { $match: filter },
-            eligibleStage,
+            eligibleOrderStage,
             { $unwind: '$items' },
             {
               $group: {
