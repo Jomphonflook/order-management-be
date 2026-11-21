@@ -77,6 +77,7 @@ export interface DashboardData {
     sku: string;
     quantity: number;
     salesCents: number;
+    imageUrl?: string;
   }>;
   recentOrders: OrderDocument[];
   range: { from: string; to: string };
@@ -710,6 +711,14 @@ export class OrdersService implements OnModuleInit {
               },
             },
             {
+              $lookup: {
+                from: this.productModel.collection.name,
+                localField: '_id',
+                foreignField: '_id',
+                as: 'product',
+              },
+            },
+            {
               $project: {
                 _id: 0,
                 productId: { $toString: '$_id' },
@@ -717,6 +726,23 @@ export class OrdersService implements OnModuleInit {
                 sku: 1,
                 quantity: 1,
                 salesCents: 1,
+                imageUrl: {
+                  $arrayElemAt: [
+                    {
+                      $map: {
+                        input: {
+                          $ifNull: [
+                            { $arrayElemAt: ['$product.images', 0] },
+                            [],
+                          ],
+                        },
+                        as: 'image',
+                        in: '$$image.url',
+                      },
+                    },
+                    0,
+                  ],
+                },
               },
             },
             { $sort: { quantity: -1, salesCents: -1 } },
